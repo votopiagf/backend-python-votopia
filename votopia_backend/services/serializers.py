@@ -23,15 +23,24 @@ class LoginSerializer(serializers.Serializer):
             columns = [col[0] for col in cursor.description]
             user = dict(zip(columns, row))
 
-        # Creo il token JWT con payload custom
-        refresh = RefreshToken.for_user(user['id'])  # qui user['id'] è l'id del tuo utente
+        # Creo il token JWT manualmente con payload custom
+        refresh = RefreshToken()
         refresh['user_id'] = user['id']
-        refresh['name'] = user['name']
+        refresh['name'] = user.get('name', '')
+        refresh['surname'] = user.get('surname', '')
         refresh['email'] = user['email']
-        refresh['org_id'] = user['org_id']
+        refresh['org_id'] = user.get('org_id')
+
+        # Creo l'access token dal refresh token
+        access = refresh.access_token
+        access['user_id'] = user['id']
+        access['name'] = user.get('name', '')
+        access['surname'] = user.get('surname', '')
+        access['email'] = user['email']
+        access['org_id'] = user.get('org_id')
 
         return {
             'user': user,
-            'access': str(refresh.access_token),
+            'access': str(access),
             'refresh': str(refresh)
         }
