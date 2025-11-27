@@ -154,9 +154,8 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
+    # Autenticazione gestita manualmente nelle views con get_user_from_token()
+    # Rimosso DEFAULT_AUTHENTICATION_CLASSES per evitare conflitti con il modello User personalizzato
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
     ),

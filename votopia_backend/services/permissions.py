@@ -53,7 +53,7 @@ def get_user_permissions(user_id):
     try:
         with connection.cursor() as cursor:
             query = """
-                    SELECT DISTINCT p.name, p.description
+                    SELECT DISTINCT p.id, p.name, p.description
                     FROM users u
                              INNER JOIN user_roles ur ON u.id = ur.user_id
                              INNER JOIN roles r ON ur.role_id = r.id
@@ -68,8 +68,9 @@ def get_user_permissions(user_id):
             permissions = []
             for row in rows:
                 permissions.append({
-                    'name': row[0],
-                    'description': row[1]
+                    'id': row[0],
+                    'name': row[1],
+                    'description': row[2]
                 })
 
             return permissions
