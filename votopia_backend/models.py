@@ -105,6 +105,7 @@ class User(models.Model):
     org = models.ForeignKey(Organization, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     deleted = models.BooleanField(default=False)
+    must_change_password = models.BooleanField(default=True)
 
     roles = models.ManyToManyField('Role', through='UserRole', related_name='users')
     lists = models.ManyToManyField('List', through='UserList', related_name='users')
@@ -152,6 +153,8 @@ class Role(models.Model):
     org = models.ForeignKey(Organization, null=True, on_delete=models.SET_NULL)
     list = models.ForeignKey(List, null=True, on_delete=models.SET_NULL)
     name = models.CharField(max_length=50)
+    color = models.CharField(max_length=7, null=True)
+    level = models.IntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
 
     permissions = models.ManyToManyField(Permission, through='RolePermission', related_name='roles')

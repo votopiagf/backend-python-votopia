@@ -5,6 +5,8 @@ from django.db import connection
 from rest_framework.response import Response
 from rest_framework import status
 
+from votopia_backend.models import List
+
 
 def check_user_permission(user_id, permission_name):
     """
@@ -194,3 +196,30 @@ def verify_user_exists(user_id):
     except Exception as e:
         print(f"Errore nella verifica utente: {str(e)}")
         return False
+
+
+def get_lists_user_has_permission(user, permission_name):
+    """
+    Restituisce tutte le liste che l'utente può vedere
+    basandosi su un permesso specifico passato come parametro.
+
+    Args:
+        user: istanza dell'utente (User)
+        permission_name: nome del permesso da controllare (str)
+
+    Returns:
+        QuerySet di List
+    """
+    # Controlla se l'utente ha il permesso globale tramite i suoi ruoli
+    has_global_permission = user.roles.filter(
+        permissions__name=permission_name
+    ).exists()
+
+    if has_global_permission:
+        # L'utente può vedere tutte le liste della sua organizzazione
+        lists = List.objects.filter(org=user.org)
+    else:
+        # L'utente vede solo le liste in cui è effettivamente membro
+        lists = List.objects.filter(users=user)
+
+    return lists
