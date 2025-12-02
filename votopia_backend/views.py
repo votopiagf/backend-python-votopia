@@ -1,4 +1,5 @@
 import hashlib
+import re
 
 from django.db import IntegrityError
 from django.db.models import Max
@@ -38,6 +39,98 @@ def serialize_user_data(u):
         'roles': [{'id': r.id, 'name': r.name} for r in u.roles.all()],
     }
 
+
+def serialize_role_data(role_object):
+    """
+    Serializza l'oggetto modello Role (Ruolo) in un dizionario per l'output API.
+
+    Inclusi i dati principali del ruolo e la lista dei permessi associati.
+
+    :param role_object: L'istanza dell'oggetto Role.
+    :type role_object: Role
+    :returns: Dizionario contenente i dati serializzati del ruolo.
+    :rtype: dict
+    """
+
+    # Recupera tutti i permessi associati a questo ruolo.
+    # .values('id', 'name') estrae solo i campi ID e Nome, ottimizzando la query.
+    permissions_data = list(
+        role_object.permissions.all().values('id', 'name')
+    )
+
+    # Determina l'ambito del ruolo per facilitare la gestione del frontend.
+    is_org_level = role_object.list is None
+
+    role_data = {
+        'id': role_object.id,
+        'name': role_object.name,
+        'color': role_object.color,
+        'level': role_object.level,
+        'created_at': role_object.created_at.isoformat() if role_object.created_at else None,
+
+        # Campi Foreign Key
+        'org_id': role_object.org_id,
+        'list_id': role_object.list_id,
+
+        # Ambito logico (sostituisce il campo org_level mancante)
+        'is_organization_level': is_org_level,
+
+        # Dati relazionali
+        'permissions': permissions_data,
+        'permissions_count': len(permissions_data)
+    }
+
+    return role_data
+
+def serialize_list_data(list_object):
+    """
+    Serializza l'oggetto modello List in un dizionario per l'output API.
+
+    Inclusi i dati principali della lista e il conteggio delle associazioni
+    (es. utenti o ruoli, se la relazione è accessibile direttamente).
+
+    :param list_object: L'istanza dell'oggetto List.
+    :type list_object: List
+    :returns: Dizionario contenente i dati serializzati della lista.
+    :rtype: dict
+    """
+
+    # Assumiamo che ci sia una relazione Many-to-Many con gli utenti ('users')
+    # e una con i ruoli ('roles') sul modello List, o viceversa tramite un related_name.
+
+    # Recupera il conteggio degli elementi correlati (es. membri)
+    try:
+        members_count = list_object.users.count()
+    except:
+        # Fallback nel caso la relazione 'users' non esista o sia inaccessibile
+        members_count = 0
+
+    # Recupera il conteggio dei ruoli specifici della lista
+    try:
+        roles_count = list_object.roles.count()
+    except:
+        # Fallback
+        roles_count = 0
+
+    list_data = {
+        'id': list_object.id,
+        'name': list_object.name,
+        'description': list_object.description,
+        'slogan': list_object.slogan,
+        'color_primary': list_object.color_primary,
+        'color_secondary': list_object.color_secondary,
+
+        # Foreign Key e timestamp
+        'org_id': list_object.org_id,
+        'logo_file_id': list_object.logo_file_id,
+        'created_at': list_object.created_at.isoformat() if hasattr(list_object, 'created_at') else None,
+
+        # Conteggi
+        'members_count': members_count,
+        'roles_count': roles_count,
+    }
+
+    return list_data
 
 # =========================================================================
 # VIEW IMPLEMENTATE
@@ -161,7 +254,7 @@ def register(request):
             if not role:
                 continue
 
-            if role.org_level:
+            if role.level:
                 if not can_org:
                     continue
                 max_level = auth_user.roles.filter(org_id=org_id, org_level=True).aggregate(Max('level'))['level__max'] or 0
@@ -783,7 +876,7 @@ def create_role(request):
             max_auth_level = max_level_query.get('max_level') or 0
 
             # Controllo Gerarchico
-            if new_level > max_auth_level:
+            if new_level >= max_auth_level:
                 return Response({
                     'status': 'error',
                     'error': 'Violazione gerarchica (Org)',
@@ -823,7 +916,7 @@ def create_role(request):
             max_auth_level = max_level_query.get('max_level') or 0
 
             # Controllo Gerarchico
-            if new_level > max_auth_level:
+            if new_level >= max_auth_level:
                 return Response({
                     'status': 'error',
                     'error': 'Violazione gerarchica (Lista)',
@@ -870,3 +963,1008 @@ def create_role(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+@api_view(['PUT'])
+def update_role(request):
+    """
+    Aggiorna i dettagli di un Ruolo esistente (name, color, level, permissions).
+
+    Questa view implementa rigorosi controlli di visibilità, gerarchia e sicurezza:
+
+    1. **Autorità di Modifica (Livello Ruolo Target):** L'utente può modificare solo ruoli
+       con un ``level`` **strettamente inferiore** al proprio massimo livello di autorità
+       nel contesto (Organizzazione o Lista).
+    2. **Autorità di Assegnazione (Nuovo Livello):** Il nuovo ``level`` del ruolo target
+       non può superare il massimo livello di autorità dell'utente creatore.
+    3. **Controllo di Possessione dei Permessi:** L'utente può assegnare al ruolo target
+       SOLO i permessi che possiede personalmente.
+    4. **Permessi Richiesti:** ``update_role_organization`` (per ruoli Org/qualsiasi Lista)
+       o ``update_role_list`` (per ruoli nella Lista specifica).
+
+    :param request: Oggetto Request di Django REST Framework.
+        Il body della richiesta (JSON) deve contenere:
+
+        * **role_id** (int): ID del ruolo da aggiornare (obbligatorio).
+        * **name** (str, opzionale): Nuovo nome.
+        * **color** (str, opzionale): Nuovo codice colore.
+        * **level** (int, opzionale): Nuovo livello gerarchico.
+        * **permissions** (list[int], opzionale): Lista degli ID dei permessi da assegnare/sovrascrivere.
+
+    :type request: :class:`rest_framework.request.Request`
+
+    :returns: Risposta JSON con i dettagli aggiornati del ruolo.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+
+    :raises 401: Autenticazione JWT mancante o non valida.
+    :raises 404: Utente autenticato non trovato o Ruolo target non trovato.
+    :raises 400: Parametro ``role_id`` mancante o ID di permesso non valido.
+    :raises 403:
+        * Permessi insufficienti per la modifica.
+        * Ruolo target appartenente a un'altra Organizzazione.
+        * **Violazione gerarchica:** Tentativo di modificare un ruolo con livello >= proprio max livello.
+        * **Violazione gerarchica:** Tentativo di impostare un ``new_level`` > proprio max livello.
+        * Tentativo di assegnare permessi non posseduti dall'utente creatore.
+    :raises 409: Errore di conflitto (es. nome ruolo duplicato).
+    :raises 500: Errore interno del server.
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({
+                'status': 'error',
+                'error': 'Autenticazione richiesta',
+                'message': 'Token JWT mancante o non valido.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+        user = User.objects.filter(id=auth_user_id).first()
+
+        if user is None:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        data = request.data
+        role_target_id = data.get('role_id')
+
+        if not role_target_id:
+            return Response({
+                'status': 'error',
+                'error': 'Dati mancanti',
+                'message': 'Il campo role_id è obbligatorio per l\'aggiornamento.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        role_target = Role.objects.filter(id=role_target_id).first()
+
+        if not role_target:
+            return Response({
+                'status': 'error',
+                'error': 'Risorsa non trovata',
+                'message': f'Ruolo con ID {role_target_id} non trovato.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # 2. CONTROLLO BASE DEI PERMESSI
+        can_org = check_user_permission(user.id, 'update_role_organization')
+        can_list = check_user_permission(user.id, 'update_role_list')
+        target_org_id = user.org.id
+
+        # 3. VERIFICA AMBITO DEL RUOLO TARGET E PERMESSI NECESSARI
+        is_org_role_target = role_target.list_id is None  # Ruolo Org
+        is_list_role_target = role_target.list_id is not None  # Ruolo Lista
+
+        # Check: Ruolo target deve essere nella stessa Org
+        if role_target.org_id != target_org_id:
+            return Response({
+                'status': 'error',
+                'error': 'Accesso negato',
+                'message': 'Non puoi modificare ruoli appartenenti ad altre organizzazioni.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # Determine max_auth_level e verifica permessi specifici (List)
+        max_auth_level = 0
+
+        if is_org_role_target:
+            if not can_org:
+                return Response({'error': 'Permesso update_role_organization richiesto.'},
+                                status=status.HTTP_403_FORBIDDEN)
+
+            # Calcolo MAX LEVEL ORG dell'utente creatore
+            max_level_query = user.roles.filter(list__isnull=True, org_id=target_org_id).aggregate(
+                max_level=Max('level'))
+            max_auth_level = max_level_query.get('max_level') or 0
+
+        elif is_list_role_target:
+            if not (can_org or can_list):
+                return Response({'error': 'Permesso di modifica ruoli mancante (Org o Lista).'},
+                                status=status.HTTP_403_FORBIDDEN)
+
+            # Se ha solo can_list, deve avere il permesso su quella specifica lista
+            if can_list and not can_org:
+                has_perm_on_list = user.roles.filter(
+                    list_id=role_target.list_id,
+                    permissions__name='update_role_list'
+                ).exists()
+                if not has_perm_on_list:
+                    return Response({'error': 'Non hai il permesso "update_role_list" per questa specifica lista.'},
+                                    status=status.HTTP_403_FORBIDDEN)
+
+            # Calcolo MAX LEVEL LISTA dell'utente creatore nella lista target
+            max_level_query = user.roles.filter(list_id=role_target.list_id, org_id=target_org_id).aggregate(
+                max_level=Max('level'))
+            max_auth_level = max_level_query.get('max_level') or 0
+
+        # 4. CONTROLLO GERARCHICO (RUOLO TARGET)
+        # L'utente non può modificare un ruolo il cui livello è uguale o superiore al proprio max level
+        if role_target.level >= max_auth_level:
+            return Response({
+                'status': 'error',
+                'error': 'Violazione gerarchica',
+                'message': f'Non puoi modificare il ruolo "{role_target.name}" (Level {role_target.level}) perché è uguale o superiore al tuo massimo livello di autorità ({max_auth_level}).'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 5. APPLICAZIONE AGGIORNAMENTI E CONTROLLO NUOVO LEVEL
+
+        # Aggiornamento Livello: verifica che il nuovo level non superi l'autorità dell'utente
+        if 'level' in data and data['level'] is not None:
+            new_level = int(data['level'])
+            if new_level > max_auth_level:
+                return Response({
+                    'status': 'error',
+                    'error': 'Violazione gerarchica (Nuovo Livello)',
+                    'message': f'Non puoi impostare un livello {new_level}, il tuo massimo di autorità è {max_auth_level}.'
+                }, status=status.HTTP_403_FORBIDDEN)
+            role_target.level = new_level
+
+        # Aggiornamento Nome e Colore
+        if 'name' in data and data['name']:
+            role_target.name = data['name']
+        if 'color' in data and data['color']:
+            role_target.color = data['color']
+
+        # 6. AGGIORNAMENTO PERMESSI (Controllo di Possessione)
+        if 'permissions' in data and data['permissions'] is not None:
+            permissions_ids = data['permissions']
+
+            # Controllo di Possessione dei Permessi (come in create_role)
+            auth_perms = get_user_permissions(auth_user_id)
+            auth_perm_ids = {p['id'] for p in auth_perms}
+            invalid_perms_ids = [pid for pid in permissions_ids if pid not in auth_perm_ids]
+
+            if invalid_perms_ids:
+                return Response({
+                    'status': 'error',
+                    'error': 'Permessi non posseduti',
+                    'message': f'Non puoi assegnare permessi che non possiedi. ID non validi: {invalid_perms_ids}'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            # Esecuzione Set dei Permessi
+            valid_permissions = Permission.objects.filter(id__in=permissions_ids)
+            role_target.permissions.set(valid_permissions)
+
+        # 7. SALVATAGGIO FINALE
+        role_target.save()
+
+        # 8. RISPOSTA
+        return Response({
+            'status': 'success',
+            'message': 'Ruolo aggiornato correttamente.',
+            'data': {
+                'id': role_target.id,
+                'name': role_target.name,
+                'level': role_target.level,
+                'color': role_target.color,
+                'org_id': role_target.org_id,
+                'list_id': role_target.list_id,
+                'permissions_count': role_target.permissions.count()  # Conta i permessi dopo l'update
+            }
+        }, status=status.HTTP_200_OK)
+
+    except IntegrityError as e:
+        # Gestisce errori di integrità come le chiavi uniche (es. nome ruolo duplicato)
+        return Response({
+            'status': 'error',
+            'error': 'Errore di conflitto',
+            'message': 'Un ruolo con questo nome o combinazione di chiavi uniche esiste già.'
+        }, status=status.HTTP_409_CONFLICT)
+
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['DELETE'])
+def delete_role(request):
+    """
+    Elimina definitivamente un Ruolo esistente (Hard Delete).
+
+    Questa view esegue controlli stringenti di visibilità e gerarchia:
+
+    1. **Autorità di Eliminazione:** L'utente può eliminare solo ruoli con un ``level``
+       **strettamente inferiore** al proprio massimo livello di autorità nel contesto
+       (Organizzazione o Lista).
+    2. **Permessi Richiesti:** ``delete_role_organization`` (per ruoli Org/qualsiasi Lista)
+       o ``delete_role_list`` (per ruoli nella Lista specifica, se non si possiede il permesso Org).
+
+    :param request: Oggetto Request di Django REST Framework.
+        Il parametro di query string deve contenere:
+
+        * **role_id** (int): ID del ruolo da eliminare.
+
+    :type request: :class:`rest_framework.request.Request`
+
+    :returns: Risposta JSON di successo.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+
+    :raises 401: Autenticazione JWT mancante o non valida.
+    :raises 404: Utente autenticato non trovato o Ruolo target non trovato.
+    :raises 400: Parametro ``role_id`` mancante.
+    :raises 403:
+        * Permessi insufficienti per l'eliminazione.
+        * Ruolo target appartenente a un'altra Organizzazione.
+        * **Violazione gerarchica:** Tentativo di eliminare un ruolo con livello >= proprio max livello nel contesto.
+        * Permesso specifico ``delete_role_list`` mancante per la lista target.
+    :raises 500: Errore interno del server.
+    """
+    try:
+        role_id_target = request.GET.get('role_id')
+        auth_user = get_user_from_token(request)
+
+        # 1. AUTENTICAZIONE
+        if auth_user is None:
+            return Response({
+                'status': 'error',
+                'error': 'Autenticazione richiesta',
+                'message': 'Token JWT mancante o non valido.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user.get('user_id')
+        user = User.objects.filter(id=auth_user_id).first()
+
+        if not user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        target_org_id = user.org.id if user.org else None
+
+        # 2. VALIDAZIONE INPUT
+        if role_id_target is None:
+            return Response({
+                'status': 'error',
+                'error': 'Dati mancanti',
+                'message': 'Il parametro role_id è obbligatorio per l\'eliminazione.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        role_target = Role.objects.filter(id=role_id_target).first()
+
+        if not role_target:
+            return Response({
+                'status': 'error',
+                'error': 'Risorsa non trovata',
+                'message': f'Ruolo con ID {role_id_target} non trovato.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # 3. CONTROLLO ORGANIZZAZIONE (Visibilità)
+        if role_target.org_id != target_org_id:
+            return Response({
+                'status': 'error',
+                'error': 'Accesso negato',
+                'message': 'Non puoi eliminare ruoli appartenenti ad altre organizzazioni.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 4. CONTROLLO PERMESSI GENERALI
+        can_org = check_user_permission(user.id, 'delete_role_organization')
+        can_list = check_user_permission(user.id, 'delete_role_list')
+
+        if not (can_org or can_list):
+            return Response({
+                'status': 'error',
+                'error': 'Permesso negato',
+                'message': 'Non hai i permessi necessari per eliminare ruoli.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 5. DETERMINAZIONE AMBITO DEL RUOLO TARGET
+        is_org_role_target = role_target.list_id is None  # Ruolo Org
+        is_list_role_target = role_target.list_id is not None  # Ruolo Lista
+
+        max_auth_level = 0
+
+        # 6. VERIFICA CONTESTO E GERARCHIA
+
+        # 6.1 CASO RUOLO ORGANIZZAZIONE
+        if is_org_role_target:
+            if not can_org:
+                return Response({'error': 'Permesso delete_role_organization richiesto per eliminare ruoli Org.'},
+                                status=status.HTTP_403_FORBIDDEN)
+
+            # Calcolo MAX LEVEL ORG (Filtra solo i ruoli dell'utente che hanno list=NULL)
+            max_level_query = user.roles.filter(list__isnull=True, org_id=target_org_id).aggregate(
+                max_level=Max('level'))
+            max_auth_level = max_level_query.get('max_level') or 0
+
+        # 6.2 CASO RUOLO LISTA
+        elif is_list_role_target:
+            # L'utente deve avere can_org OPPURE deve avere can_list SULLA SPECIFICA lista
+            if not can_org:
+                # Se ha solo can_list, verifica che abbia il permesso sulla lista target
+                if not can_list or not user.roles.filter(list_id=role_target.list_id,
+                                                         permissions__name='delete_role_list').exists():
+                    return Response({'error': 'Non hai il permesso di eliminare ruoli in questa specifica lista.'},
+                                    status=status.HTTP_403_FORBIDDEN)
+
+            # Calcolo MAX LEVEL LISTA (Filtra solo i ruoli dell'utente che hanno list_id specifico)
+            max_level_query = user.roles.filter(list_id=role_target.list_id, org_id=target_org_id).aggregate(
+                max_level=Max('level'))
+            max_auth_level = max_level_query.get('max_level') or 0
+
+        # 7. CONTROLLO GERARCHICO FINALE
+        if role_target.level >= max_auth_level:
+            return Response({
+                'status': 'error',
+                'error': 'Violazione gerarchica',
+                'message': f'Non puoi eliminare il ruolo "{role_target.name}" (Level {role_target.level}) perché è uguale o superiore al tuo massimo livello di autorità ({max_auth_level}) nel contesto.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 8. ESECUZIONE ELIMINAZIONE
+        role_target.delete()
+
+        return Response({
+            'status': 'success',
+            'message': f'Ruolo con ID {role_id_target} eliminato correttamente.'
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def view_all_roles(request):
+    """
+    Restituisce tutti i ruoli visibili all'utente autenticato, filtrati per Organizzazione o Lista.
+
+    Filtro per Organizzazione (list_id=None): Richiede 'view_all_role_organization'.
+    Filtro per Lista (list_id=<ID>): Richiede 'view_all_role_organization' (per tutte le liste)
+    o 'view_all_role_list' (sulla lista specificata).
+
+    :param request: Oggetto Request, accetta 'list_id' come parametro di query opzionale.
+    :type request: :class:`rest_framework.request.Request`
+    :returns: Risposta JSON con la lista dei ruoli.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+    :raises 401: Autenticazione JWT mancante.
+    :raises 403: Permesso negato.
+    :raises 404: Utente non trovato o Lista target non trovata/non appartenente all'Org.
+    """
+    # 1. Recupero parametri
+    list_id_raw = request.GET.get('list_id')
+    list_id = int(list_id_raw) if list_id_raw is not None else None
+
+    # 2. Autenticazione
+    auth_user_data = get_user_from_token(request)
+    if not auth_user_data:
+        return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    auth_user_id = auth_user_data.get('user_id')
+    user = User.objects.filter(id=auth_user_id).first()
+
+    if not user:
+        return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+    target_org_id = user.org.id if user.org else None
+    if target_org_id is None:
+        return Response({'error': 'Utente non associato ad alcuna Organizzazione valida'},
+                        status=status.HTTP_403_FORBIDDEN)
+
+    # 3. Controllo permessi
+    can_org = check_user_permission(user.id, 'view_all_role_organization')
+    can_list = check_user_permission(user.id, 'view_all_role_list')
+
+    if not (can_org or can_list):
+        return Response({
+            'error': 'Permesso negato',
+            'message': 'Non hai permessi per visualizzare ruoli (Org o Lista)'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    roles = []
+
+    # 4. CASO 1: Filtro Organizzazione (list_id è None)
+    if list_id is None:
+        if can_org:
+            # Recupera TUTTI i ruoli (Org e Lista) appartenenti alla sua Organizzazione.
+            roles_qs = Role.objects.filter(org_id=target_org_id)
+            roles = [serialize_role_data(r) for r in roles_qs]
+            return Response({
+                'status': 'success',
+                'message': 'Ruoli dell\'organizzazione recuperati',
+                'data': {'roles': roles}
+            }, status=status.HTTP_200_OK)
+        else:
+            # Non ha il permesso Org e list_id è None (non può vedere tutto)
+            return Response({
+                'error': 'Permesso negato',
+                'message': 'È richiesto il permesso view_all_role_organization per visualizzare tutti i ruoli.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+    # 5. CASO 2: Filtro per Lista Specifica (list_id è presente)
+
+    # 5.1 Verifica esistenza e appartenenza della Lista
+    list_target = List.objects.filter(id=list_id, org_id=target_org_id).first()
+    if list_target is None:
+        return Response({
+            'error': 'Risorsa non trovata',
+            'message': f'Lista con ID {list_id} non trovata nella tua organizzazione.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    # 5.2 Verifica Autorizzazione
+    if can_org:
+        # Se ha il permesso Organizzazione, può vedere i ruoli di qualsiasi lista
+        roles_qs = Role.objects.filter(list_id=list_id)
+
+    else:  # Solo permesso 'view_all_role_list' è presente
+        if not can_list:  # Già controllato al punto 3, ma per chiarezza
+            return Response({'error': 'Permesso interno mancante'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Controlla se l'utente ha il permesso 'view_all_role_list' su QUESTA specifica lista
+        my_allowed_lists = get_lists_user_has_permission(user, 'view_all_role_list')
+        allowed_list_ids = my_allowed_lists.values_list('id', flat=True)
+
+        if list_id not in allowed_list_ids:
+            return Response({
+                'error': 'Permesso negato',
+                'message': 'Non hai accesso a visualizzare i ruoli di questa lista specifica.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # Se autorizzato sulla lista specifica
+        roles_qs = Role.objects.filter(list_id=list_id)
+
+    # 5.3 Serializzazione e Risposta
+    roles = [serialize_role_data(r) for r in roles_qs]
+    return Response({
+        'status': 'success',
+        'message': f'Ruoli della lista {list_id} recuperati',
+        'data': {'roles': roles}
+    }, status=status.HTTP_200_OK)
+
+    # 6. Fallback (Teoricamente non necessario grazie ai controlli precedenti, ma di sicurezza)
+    # Ritorna 403 se list_id è None e can_org è False
+    return Response({
+        'error': 'Permesso negato',
+        'message': 'Non hai permessi per visualizzare i ruoli richiesti'
+    }, status=status.HTTP_403_FORBIDDEN)
+
+@api_view(['GET'])
+def view_role_information(request):
+    """
+    Restituisce i dettagli di un ruolo specifico ('role_id') o i ruoli
+    dell'utente autenticato (se 'role_id' è omesso).
+
+    La visibilità è limitata ai ruoli della stessa Organizzazione ed è governata dai permessi:
+    - 'view_all_role_organization' per la visualizzazione completa dei ruoli Org/Lista.
+    - 'view_all_role_list' per la visualizzazione selettiva (l'utente deve avere il permesso sulla Lista del ruolo target).
+
+    In caso di permesso negato (403), restituisce i ruoli dell'utente autenticato per diagnostica.
+
+    :param request: Oggetto Request, accetta 'role_id' come parametro di query opzionale.
+    :type request: :class:`rest_framework.request.Request`
+    :returns: Risposta JSON con i dettagli del ruolo/i.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+    :raises 401: Autenticazione JWT mancante.
+    :raises 404: Ruolo target non trovato.
+    :raises 403: Permesso negato (utente non ha autorità o viola l'Org).
+    """
+    role_id_raw = request.GET.get('role_id')
+
+    # 1. Autenticazione
+    auth_user_data = get_user_from_token(request)
+    if not auth_user_data:
+        return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    auth_user_id = auth_user_data.get('user_id')
+    auth_user = User.objects.filter(id=auth_user_id).first()
+
+    if not auth_user:
+        return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+    target_org_id = auth_user.org.id if auth_user.org else None
+
+    # Prepara i ruoli dell'utente autenticato per le risposte 403
+    auth_user_roles_data = [serialize_role_data(r) for r in auth_user.roles.all()]
+
+    # Controllo permessi
+    perm_org = check_user_permission(auth_user_id, 'view_all_role_organization')
+    perm_lists = check_user_permission(auth_user_id, 'view_all_role_list')
+
+    roles = []
+
+    # Caso 1: Nessun role_id fornito (visualizza i propri ruoli)
+    if not role_id_raw:
+        roles = list(auth_user.roles.all())
+
+    # Caso 2: role_id fornito (visualizza un ruolo specifico)
+    else:
+        try:
+            role_id = int(role_id_raw)
+        except ValueError:
+            return Response({'error': 'role_id non valido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        role_to_view = Role.objects.filter(id=role_id).first()
+
+        if not role_to_view:
+            return Response({'error': 'Ruolo target non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Verifica Organizzazione (Il ruolo deve essere nella stessa Org)
+        if role_to_view.org_id != target_org_id:
+            return Response({
+                'error': 'Permesso negato',
+                'message': 'Non puoi visualizzare ruoli di altre organizzazioni.',
+                'user_roles': auth_user_roles_data
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 2.1 Autorizzazione tramite permesso Org
+        if perm_org:
+            roles = [role_to_view]
+
+        # 2.2 Autorizzazione tramite permesso Lista (Solo se il ruolo è di lista)
+        elif role_to_view.list_id is not None and perm_lists:
+
+            # Controlla se l'utente ha il permesso 'view_all_role_list' sulla lista specifica
+            my_allowed_lists = get_lists_user_has_permission(auth_user, 'view_all_role_list')
+            allowed_list_ids = my_allowed_lists.values_list('id', flat=True)
+
+            if role_to_view.list_id not in allowed_list_ids:
+                return Response({
+                    'error': 'Permesso negato',
+                    'message': 'Non hai il permesso di visualizzare ruoli in questa lista specifica.',
+                    'user_roles': auth_user_roles_data
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            roles = [role_to_view]
+
+        # 2.3 Nessun permesso o il ruolo è Org e manca perm_org
+        else:
+            message = "Non hai permessi sufficienti per visualizzare questo ruolo."
+            if role_to_view.list_id is None:
+                message += " È richiesto il permesso 'view_all_role_organization'."
+
+            return Response({
+                'error': 'Permesso negato',
+                'message': message,
+                'user_roles': auth_user_roles_data
+            }, status=status.HTTP_403_FORBIDDEN)
+
+    # Serializzazione ruoli
+    roles_data = [serialize_role_data(r) for r in roles]
+
+    return Response({
+        'status': 'success',
+        'message': 'Informazioni ruolo/i recuperate',
+        'data': {
+            'roles': roles_data,
+            'count': len(roles_data)
+        }
+    }, status=status.HTTP_200_OK)
+
+# Regex per validare codici colore esadecimali (es. #FF0000)
+HEX_COLOR_REGEX = re.compile(r'^#([A-Fa-f0-9]{6})$')
+
+
+@api_view(['PUT'])
+def update_list(request):
+    """
+    Aggiorna i dettagli di una Lista esistente (nome, descrizione, colori, logo, ecc.).
+
+    Questa view implementa controlli di sicurezza rigorosi:
+    1. **Verifica Organizzazione:** La Lista deve appartenere alla stessa Organizzazione dell'utente autenticato.
+    2. **Autorizzazione:** L'utente deve possedere il permesso 'update_list_organization' (per modificare qualsiasi lista)
+       oppure il permesso 'update_list_list' (se posseduto tramite un ruolo associato alla Lista target).
+    3. **Validazione Dati:** I campi di input (es. ID, colori esadecimali) vengono validati rigorosamente.
+
+    :param request: Oggetto Request di Django REST Framework.
+        Il body della richiesta (JSON) deve contenere:
+
+        * **list_id** (int): ID della Lista da aggiornare (obbligatorio).
+        * **name** (str, opzionale): Nuovo nome della lista.
+        * **description** (str, opzionale): Nuova descrizione.
+        * **slogan** (str, opzionale): Nuovo slogan.
+        * **color_primary** (str, opzionale): Nuovo codice colore primario (formato esadecimale #RRGGBB).
+        * **color_secondary** (str, opzionale): Nuovo codice colore secondario (formato esadecimale #RRGGBB).
+        * **logo_file_id** (int/None, opzionale): ID del file del logo (o None per rimuoverlo).
+
+    :type request: :class:`rest_framework.request.Request`
+
+    :returns: Risposta JSON con i dettagli aggiornati della Lista.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+
+    :raises 401: Autenticazione JWT mancante o non valida.
+    :raises 404: Utente autenticato o Lista target non trovati.
+    :raises 400: Parametro ``list_id`` mancante/non valido o formato colore errato.
+    :raises 403: Permesso negato (mancanza di autorizzazione o violazione dell'Organizzazione).
+    :raises 409: Errore di conflitto (es. nome Lista duplicato, violazione UniqueConstraint).
+    :raises 500: Errore interno del server.
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+        auth_user = User.objects.filter(id=auth_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        data = request.data
+        list_id_target_raw = data.get('list_id')
+
+        # 1.1 VALIDAZIONE ID LISTA
+        if not list_id_target_raw:
+            return Response({'error': 'Il campo list_id è obbligatorio'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            list_id_target = int(list_id_target_raw)
+        except ValueError:
+            return Response({'error': 'Il campo list_id deve essere un numero intero valido.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # 1.2 RECUPERO LISTA TARGET
+        list_target = List.objects.filter(id=list_id_target).first()
+
+        if not list_target:
+            return Response({'error': f'Lista con ID {list_id_target} non trovata'}, status=status.HTTP_404_NOT_FOUND)
+
+        # 2. CONTROLLO PERMESSI
+        can_modify_org = check_user_permission(auth_user_id, 'update_list_organization')
+        can_modify_lists = check_user_permission(auth_user_id, 'update_list_list')
+
+        # 3. VERIFICA ORGANIZZAZIONE
+        if list_target.org.id != auth_user.org.id:
+            return Response({
+                'error': 'Accesso negato',
+                'message': 'La lista non appartiene alla tua Organizzazione.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 4. VERIFICA AUTORIZZAZIONE DI MODIFICA (Logica inalterata, corretta)
+        is_authorized = False
+
+        if can_modify_org:
+            is_authorized = True
+
+        elif can_modify_lists:
+            has_perm_on_list = auth_user.roles.filter(
+                list_id=list_id_target,
+                permissions__name='update_list_list'
+            ).exists()
+
+            if has_perm_on_list:
+                is_authorized = True
+
+        if not is_authorized:
+            return Response({
+                'error': 'Permesso negato',
+                'message': 'Non hai il permesso necessario (update_list_organization o update_list_list) per modificare questa lista.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 5. APPLICAZIONE E VALIDAZIONE AGGIORNAMENTI
+        updated = False
+
+        if 'name' in data and data['name'] is not None:
+            list_target.name = data['name'].strip()
+            updated = True
+
+        if 'description' in data and data['description'] is not None:
+            list_target.description = data['description'].strip()
+            updated = True
+
+        if 'slogan' in data and data['slogan'] is not None:
+            list_target.slogan = data['slogan'].strip()
+            updated = True
+
+        # Validazione Colore Primario
+        if 'color_primary' in data and data['color_primary'] is not None:
+            color = data['color_primary'].upper()
+            if HEX_COLOR_REGEX.match(color):
+                list_target.color_primary = color
+                updated = True
+            else:
+                return Response({'error': 'Formato colore primario non valido. Deve essere #RRGGBB.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+        # Validazione Colore Secondario
+        if 'color_secondary' in data and data['color_secondary'] is not None:
+            color = data['color_secondary'].upper()
+            if HEX_COLOR_REGEX.match(color):
+                list_target.color_secondary = color
+                updated = True
+            else:
+                return Response({'error': 'Formato colore secondario non valido. Deve essere #RRGGBB.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+        # Validazione logo_file_id (Assumendo che sia un intero o None)
+        if 'logo_file_id' in data:
+            logo_id = data['logo_file_id']
+            if logo_id is None or (isinstance(logo_id, int) and logo_id > 0):
+                list_target.logo_file_id = logo_id
+                updated = True
+            else:
+                return Response({'error': 'Il campo logo_file_id non è valido.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if updated:
+            list_target.save()
+
+            # 6. RISPOSTA DI SUCCESSO
+            return Response({
+                'status': 'success',
+                'message': f'Lista ID {list_id_target} aggiornata correttamente.',
+                'data': {
+                    'id': list_target.id,
+                    'name': list_target.name,
+                    'description': list_target.description,
+                    'slogan': list_target.slogan,
+                    'color_primary': list_target.color_primary,
+                    'color_secondary': list_target.color_secondary,
+                    'logo_file_id': list_target.logo_file_id,
+                    'org_id': list_target.org_id,
+                }
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                'status': 'warning',
+                'message': 'Nessun dato valido fornito per l\'aggiornamento.'
+            }, status=status.HTTP_200_OK)
+
+    # GESTIONE ECCEZIONI SPECIFICHE
+    except IntegrityError as e:
+        # Se c'è un UniqueConstraint (es. nome lista duplicato all'interno della stessa Org)
+        return Response({
+            'status': 'error',
+            'error': 'Errore di Conflitto (Duplicato)',
+            'message': 'Una lista con questo nome o ID esiste già nella tua Organizzazione.'
+        }, status=status.HTTP_409_CONFLICT)
+
+    except Exception as e:
+        # Gestione errori generici inaspettati
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['POST'])
+def create_list(request):
+    """
+    Crea una nuova Lista (List) all'interno dell'Organizzazione dell'utente autenticato.
+
+    Implementa rigorosi controlli di sicurezza e validazione:
+    1. **Autenticazione:** Richiede un utente autenticato.
+    2. **Permesso:** Richiede il permesso 'create_list'.
+    3. **Limite Organizzazione:** Verifica che il numero di liste esistenti non superi
+       il limite massimo ('max_lists') impostato per l'Organizzazione.
+    4. **Validazione Dati:**
+        - Il campo 'name' è obbligatorio.
+        - 'color_primary' e 'color_secondary' vengono validati per il formato esadecimale (#RRGGBB).
+
+    L'associazione all'Organizzazione viene forzata sull'Organizzazione dell'utente autenticato.
+
+    :param request: Oggetto Request di Django REST Framework.
+        Il body della richiesta (JSON) deve contenere:
+
+        * **name** (str): Nome della Lista (obbligatorio).
+        * **description** (str, opzionale): Descrizione della Lista.
+        * **slogan** (str, opzionale): Slogan/Motto della Lista.
+        * **color_primary** (str, opzionale): Codice colore primario (formato esadecimale #RRGGBB).
+        * **color_secondary** (str, opzionale): Codice colore secondario (formato esadecimale #RRGGBB).
+        * **logo_file_id** (int/None, opzionale): ID del file del logo (Foreign Key).
+
+    :type request: :class:`rest_framework.request.Request`
+
+    :returns: Risposta JSON con i dettagli della Lista creata.
+    :rtype: :class:`rest_framework.response.Response` con status 201 CREATED
+
+    :raises 401: Autenticazione JWT mancante o non valida.
+    :raises 404: Utente autenticato non trovato.
+    :raises 400: Dati incompleti o formato colore non valido.
+    :raises 403: Permesso 'create_list' mancante o limite massimo di liste raggiunto.
+    :raises 409: Errore di conflitto (es. nome Lista duplicato, violazione UniqueConstraint).
+    :raises 500: Errore interno del server.
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+        auth_user = User.objects.filter(id=auth_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        if auth_user.org is None:
+            return Response({'error': 'Utente non associato ad alcuna Organizzazione'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        target_org_id = auth_user.org.id
+
+        # 2. CONTROLLO PERMESSO
+        can_create = check_user_permission(auth_user.id, 'create_list')
+        if not can_create:
+            return Response({
+                'status': 'error',
+                'error': 'Permesso negato',
+                'message': 'Permesso "create_list" richiesto.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        required = ['name']
+
+        # 3. VALIDAZIONE DATI BASE
+        if not all(field in data and data[field] and str(data[field]).strip() for field in required):
+            return Response({
+                'status': 'error',
+                'error': 'Dati incompleti',
+                'message': 'Il campo name è obbligatorio e non può essere vuoto.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 4. CONTROLLO LIMITE MASSIMO LISTE
+        if auth_user.org.max_lists is not None:
+            count_list_for_organization = List.objects.filter(org_id=target_org_id).count()
+
+            if count_list_for_organization >= auth_user.org.max_lists:
+                return Response({
+                    'status': 'error',
+                    'error': 'Limite raggiunto',
+                    'message': f'L\'Organizzazione ha raggiunto il limite massimo di {auth_user.org.max_lists} liste.'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+        # 5. PREPARAZIONE E VALIDAZIONE CAMPI OPZIONALI
+
+        list_data = {
+            'name': data['name'].strip(),
+            'org_id': target_org_id,
+            'description': data.get('description', '').strip(),
+            'slogan': data.get('slogan', '').strip(),
+        }
+
+        # Validazione Colori
+        color_primary = data.get('color_primary')
+        if color_primary is not None:
+            color = color_primary.upper()
+            if not HEX_COLOR_REGEX.match(color):
+                return Response({'error': 'Formato colore primario non valido. Deve essere #RRGGBB.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            list_data['color_primary'] = color
+
+        color_secondary = data.get('color_secondary')
+        if color_secondary is not None:
+            color = color_secondary.upper()
+            if not HEX_COLOR_REGEX.match(color):
+                return Response({'error': 'Formato colore secondario non valido. Deve essere #RRGGBB.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            list_data['color_secondary'] = color
+
+        # Validazione logo_file_id (Assumendo che sia un intero o None)
+        logo_id = data.get('logo_file_id', None)
+        if logo_id is not None and not (isinstance(logo_id, int) and logo_id >= 0):
+            return Response({'error': 'Il campo logo_file_id non è valido (deve essere un intero positivo o None).'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        list_data['logo_file_id'] = logo_id
+
+        # 6. CREAZIONE
+        new_list = List.objects.create(**list_data)
+
+        # 7. RISPOSTA
+        return Response({
+            'status': 'success',
+            'message': 'Lista creata con successo.',
+            'data': {
+                'id': new_list.id,
+                'name': new_list.name,
+                'org_id': new_list.org_id,
+                'description': new_list.description,
+                'slogan': new_list.slogan,
+                'color_primary': new_list.color_primary,
+                'color_secondary': new_list.color_secondary,
+                'logo_file_id': new_list.logo_file_id,
+            }
+        }, status=status.HTTP_201_CREATED)
+
+    except IntegrityError as e:
+        # Gestisce la violazione di UniqueConstraint (es. nome lista duplicato all'interno della stessa Org)
+        return Response({
+            'status': 'error',
+            'error': 'Errore di Conflitto (Duplicato)',
+            'message': 'Una lista con questo nome esiste già nella tua Organizzazione.'
+        }, status=status.HTTP_409_CONFLICT)
+
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['GET'])
+def view_all_lists(request):
+    """
+    Restituisce tutte le Liste visibili all'utente autenticato.
+
+    La visibilità si basa sul permesso 'view_all_lists' (per vedere tutte le liste dell'Org)
+    o sull'associazione diretta dell'utente a ciascuna lista.
+
+    :param request: Oggetto Request di Django REST Framework.
+    :type request: :class:`rest_framework.request.Request`
+    :returns: Risposta JSON con la lista delle Liste.
+    :rtype: :class:`rest_framework.response.Response` con status 200 OK
+    :raises 401: Autenticazione JWT mancante.
+    :raises 404: Utente autenticato non trovato.
+    :raises 403: Utente non associato ad alcuna Organizzazione.
+    :raises 500: Errore del database o interno del server.
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+
+        # Gestione di ObjectDoesNotExist nel caso in cui User.objects.filter().first() non sia nullo ma il recupero fallisca.
+        # User.objects.filter().first() ritorna None, quindi il controllo è implicito dopo.
+        auth_user = User.objects.filter(id=auth_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        if auth_user.org is None:
+            return Response({'error': 'Utente non associato ad alcuna Organizzazione valida'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        target_org_id = auth_user.org.id
+
+        # 2. CONTROLLO PERMESSI
+        can_org = check_user_permission(auth_user.id, 'view_all_lists')
+
+        lists_qs = List.objects.none()
+
+        # 3. LOGICA DI VISIBILITÀ
+        if can_org:
+            # Caso 1: Vede tutte le liste dell'Organizzazione
+            lists_qs = List.objects.filter(org_id=target_org_id)
+        else:
+            # Caso 2: Vede solo le liste a cui è associato tramite la relazione Many-to-Many 'users'
+            # (Assumiamo che List abbia un campo users collegato a User)
+            lists_qs = List.objects.filter(users__id=auth_user.id)
+
+            # 4. SERIALIZZAZIONE E RISPOSTA
+
+        # Filtra per l'Organizzazione e rimuove i duplicati (utile se l'utente è associato a una lista con più ruoli/associazioni)
+        final_lists_qs = lists_qs.filter(org_id=target_org_id).distinct()
+
+        # Gestione delle eccezioni durante la serializzazione (es. campo mancante o relazione rotta)
+        try:
+            lists_data = [serialize_list_data(l) for l in final_lists_qs]
+        except Exception as e:
+            # Errore specifico durante la serializzazione
+            return Response({
+                'status': 'error',
+                'error': 'Errore di serializzazione dei dati della lista',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            'status': 'success',
+            'message': 'Liste recuperate con successo.',
+            'data': {
+                'lists': lists_data,
+                'count': len(lists_data)
+            }
+        }, status=status.HTTP_200_OK)
+
+    # GESTIONE ECCEZIONI GENERICHE (Per qualsiasi altro errore inaspettato)
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server inatteso',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

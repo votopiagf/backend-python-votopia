@@ -32,4 +32,14 @@ urlpatterns = [
 
     #Role routes
     path('api/roles/create/', create_role, name='create_role'),
+    path('api/roles/update/', update_role, name='update_role'),
+    path('api/roles/delete/', delete_role, name='delete_role'),
+
+    path('api/roles/all/', view_all_roles, name='view_all_roles'),
+    path('api/roles/info/', view_role_information, name='view_role_information'),
+
+    #Lists routes
+    path('api/lists/update/', update_list, name='update_list'),
+    path('api/lists/create/', create_list, name='create_list'),
+    path('api/lists/all/', view_all_lists, name='view_all_lists'),
 ]
