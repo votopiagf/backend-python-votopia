@@ -3,6 +3,7 @@ import re
 
 from django.db import IntegrityError
 from django.db.models import Max
+from drf_spectacular.utils import extend_schema
 
 from votopia_backend.models import *
 from rest_framework.decorators import api_view
@@ -352,6 +353,8 @@ class LoginView(APIView):
     (Access e Refresh Token). Utilizza un serializer dedicato (LoginSerializer).
     """
 
+    @extend_schema(summary="Login Utente", request=LoginSerializer,
+                   responses={200: {'description': 'Login successo, token restituiti'}})
     def post(self, request):
         """
         Gestisce la richiesta POST di login.

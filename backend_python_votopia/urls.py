@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.urls import path, re_path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
 from rest_framework_simplejwt.views import TokenRefreshView, TokenObtainPairView
 from votopia_backend.views import *
 
@@ -42,4 +43,22 @@ urlpatterns = [
     path('api/lists/update/', update_list, name='update_list'),
     path('api/lists/create/', create_list, name='create_list'),
     path('api/lists/all/', view_all_lists, name='view_all_lists'),
+
+    #Swagger
+    # schema raw
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+
+    # swagger UI
+    path(
+        "api/docs/",
+        SpectacularSwaggerView.as_view(url_name="schema"),
+        name="swagger-ui",
+    ),
+
+    # Redoc (per dev seri e presentazioni a dirigente 🤭)
+    path(
+        "api/redoc/",
+        SpectacularRedocView.as_view(url_name="schema"),
+        name="redoc",
+    ),
 ]
