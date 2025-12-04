@@ -187,25 +187,33 @@ SIMPLE_JWT = {
     'TOKEN_TYPE_CLAIM': 'token_type',
 }
 
-SSPECTACULAR_SETTINGS = {
+SPECTACULAR_SETTINGS = {
     "TITLE": "Votopia API",
     "DESCRIPTION": "Sistema gestione votazioni, utenti e ruoli",
     "VERSION": "1.0.0",
 
-    # serve per Swagger
+    # Opzioni generali
     "SERVE_INCLUDE_SCHEMA": False,
+    "COMPONENT_SPLIT_REQUEST": True,
 
-    # usa file locali UI
+    # File locali per UI (migliora prestazioni e funzionamento offline)
     "SWAGGER_UI_DIST": "SIDECAR",
     "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
     "REDOC_DIST": "SIDECAR",
 
-    # visibilità Bearer JWT nella UI
+    # Configurazione autenticazione JWT
+    "SECURITY": [{"BearerAuth": []}],
     "SECURITY_SCHEMES": {
         "BearerAuth": {
             "type": "http",
             "scheme": "bearer",
             "bearerFormat": "JWT",
+            "description": "Inserisci il token JWT ottenuto da /api/token/ o /api/auth/login/"
         }
     },
+
+    # Migliora la generazione dello schema
+    "SCHEMA_PATH_PREFIX": "/api/",
+    "CAMELIZE_NAMES": False,
+    "SORT_OPERATIONS": False,
 }

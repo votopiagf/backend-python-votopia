@@ -61,4 +61,11 @@ urlpatterns = [
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
+
+
+    path(
+        "api/files/add/",
+        add_file,
+        name="add_file",
+    ),
 ]

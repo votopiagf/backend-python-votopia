@@ -154,6 +154,21 @@ def update_role(request):
         if 'color' in data and data['color']:
             role_target.color = data['color']
 
+        # Aggiornamento Livello: verifica che il nuovo level non superi l'autorità dell'utente
+        if 'level' in data and data['level'] is not None:
+            new_level = int(data['level'])
+            if new_level > max_auth_level:
+                return Response({
+                    'status': 'error',
+                    'error': 'Violazione gerarchica (Nuovo Livello)',
+                    'message': f'Non puoi impostare un livello {new_level}, il tuo massimo di autorità è {max_auth_level}.'
+                }, status=status.HTTP_403_FORBIDDEN)
+            role_target.level = new_level
+
+        # Aggiornamento Nome e Colore
+        if 'name' in data and data['name']:
+            role_target.name = data['name']
+        if 'color' in data and data['color']:
         # 6. AGGIORNAMENTO PERMESSI (Controllo di Possessione)
         if 'permissions' in data and data['permissions'] is not None:
             permissions_ids = data['permissions']

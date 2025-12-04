@@ -3,17 +3,21 @@ import re
 
 from django.db import IntegrityError
 from django.db.models import Max
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+from drf_spectacular.types import OpenApiTypes
+from rest_framework.parsers import FormParser, MultiPartParser
 
 from votopia_backend.models import *
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
 from rest_framework.views import APIView
 
 from votopia_backend.services.serializers import LoginSerializer
 from votopia_backend.services.db_procedures import register_user
 from votopia_backend.services.permissions import *
+from votopia_backend.api_schemas import *
 import random
 import string
+
 
 # =========================================================================
 # FUNZIONI HELPER (per evitare codice ripetuto nelle view)
@@ -83,6 +87,7 @@ def serialize_role_data(role_object):
 
     return role_data
 
+
 def serialize_list_data(list_object):
     """
     Serializza l'oggetto modello List in un dizionario per l'output API.
@@ -133,10 +138,27 @@ def serialize_list_data(list_object):
 
     return list_data
 
+
 # =========================================================================
 # VIEW IMPLEMENTATE
 # =========================================================================
 
+@extend_schema(
+    summary="Health Check",
+    description="Verifica che il server sia attivo e funzionante. Non richiede autenticazione.",
+    tags=["System"],
+    responses={
+        200: {
+            'description': 'Server operativo',
+            'type': 'object',
+            'properties': {
+                'status': {'type': 'string', 'example': 'ok'},
+                'message': {'type': 'string', 'example': 'Server Django attivo e funzionante'},
+                'version': {'type': 'string', 'example': '1.0.0'}
+            }
+        }
+    }
+)
 @api_view(['GET'])
 def health_check(request):
     """
@@ -156,6 +178,29 @@ def health_check(request):
     }, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Registra nuovo utente",
+    description="""
+    Crea un nuovo utente e lo associa a liste e ruoli specificati.
+
+    **Permessi richiesti:** `create_user_for_organization` O `create_user_for_list`
+
+    **Regole:**
+    - Con `create_user_for_organization`: può creare utenti in qualsiasi lista
+    - Con `create_user_for_list`: può creare utenti solo in una lista alla volta dove ha il permesso
+    - I ruoli assegnabili dipendono dal livello gerarchico dell'utente autenticato
+    """,
+    tags=["Utenti"],
+    examples=[REGISTER_USER_REQUEST_EXAMPLE, REGISTER_USER_RESPONSE_EXAMPLE, ERROR_401_EXAMPLE, ERROR_403_EXAMPLE],
+    responses={
+        201: OpenApiResponse(description='Utente creato con successo'),
+        400: OpenApiResponse(description='Dati incompleti o non validi'),
+        401: OpenApiResponse(description='Autenticazione richiesta'),
+        403: OpenApiResponse(description='Permessi insufficienti'),
+        409: OpenApiResponse(description='Email già esistente'),
+        500: OpenApiResponse(description='Errore interno del server'),
+    }
+)
 @api_view(['POST'])
 def register(request):
     """
@@ -258,7 +303,8 @@ def register(request):
             if role.level:
                 if not can_org:
                     continue
-                max_level = auth_user.roles.filter(org_id=org_id, org_level=True).aggregate(Max('level'))['level__max'] or 0
+                max_level = auth_user.roles.filter(org_id=org_id, org_level=True).aggregate(Max('level'))[
+                                'level__max'] or 0
                 if role.level > max_level:
                     continue
             else:
@@ -266,7 +312,8 @@ def register(request):
                     continue
                 if role.list_id not in lists:
                     continue
-                max_level = auth_user.roles.filter(list_id=role.list_id, org_level=False).aggregate(Max('level'))['level__max'] or 0
+                max_level = auth_user.roles.filter(list_id=role.list_id, org_level=False).aggregate(Max('level'))[
+                                'level__max'] or 0
                 if role.level > max_level:
                     continue
 
@@ -300,6 +347,30 @@ def register(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+@extend_schema(
+    summary="I miei permessi",
+    description="Ritorna l'elenco completo dei permessi dell'utente autenticato con dettagli dell'account.",
+    tags=["Autenticazione"],
+    responses={
+        200: {
+            'description': 'Lista dei permessi utente',
+            'type': 'object',
+            'properties': {
+                'status': {'type': 'string', 'example': 'success'},
+                'message': {'type': 'string'},
+                'data': {
+                    'type': 'object',
+                    'properties': {
+                        'user_info': {'type': 'object'},
+                        'permissions': {'type': 'array', 'items': {'type': 'object'}},
+                        'total_permissions': {'type': 'integer'}
+                    }
+                }
+            }
+        },
+        401: OpenApiResponse(description='Autenticazione richiesta'),
+    }
+)
 @api_view(['GET'])
 def my_permissions(request):
     """
@@ -412,7 +483,8 @@ def test(request):
             'status': 'success',
             'message': 'Risultato test permessi di lista',
             'data': {
-                'allowed_lists_ids': list(get_lists_user_has_permission(user, 'view_all_user_list').values_list('id', flat=True))
+                'allowed_lists_ids': list(
+                    get_lists_user_has_permission(user, 'view_all_user_list').values_list('id', flat=True))
             }
         }, status=status.HTTP_200_OK)
 
@@ -421,6 +493,7 @@ def test(request):
             'error': 'Errore interno',
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 @api_view(['GET'])
 def view_user_information(request):
@@ -480,7 +553,7 @@ def view_user_information(request):
             users = [auth_user]
 
     # Serializzazione utenti
-    users_data = [serialize_user_data(u) for u in users] # Usa la funzione helper
+    users_data = [serialize_user_data(u) for u in users]  # Usa la funzione helper
 
     return Response({
         'status': 'success',
@@ -490,6 +563,7 @@ def view_user_information(request):
             'count': len(users_data)
         }
     }, status=status.HTTP_200_OK)
+
 
 @api_view(['GET'])
 def view_all_user(request):
@@ -530,11 +604,11 @@ def view_all_user(request):
     if list_id is None:
         if perm_org:
             users_qs = User.objects.filter(org_id=auth_user.org.id).prefetch_related('lists', 'roles')
-            users = [serialize_user_data(u) for u in users_qs] # Usa la funzione helper
+            users = [serialize_user_data(u) for u in users_qs]  # Usa la funzione helper
             return Response({
                 'status': 'success',
                 'message': 'Utenti dell\'organizzazione recuperati',
-                'data': { 'users': users }
+                'data': {'users': users}
             }, status=status.HTTP_200_OK)
         else:
             return Response({
@@ -559,11 +633,11 @@ def view_all_user(request):
             }, status=status.HTTP_403_FORBIDDEN)
 
         users_qs = User.objects.filter(lists__id=list_id).prefetch_related('lists', 'roles')
-        users = [serialize_user_data(u) for u in users_qs] # Usa la funzione helper
+        users = [serialize_user_data(u) for u in users_qs]  # Usa la funzione helper
         return Response({
             'status': 'success',
             'message': f'Utenti della lista {list_id} recuperati',
-            'data': { 'users': users }
+            'data': {'users': users}
         }, status=status.HTTP_200_OK)
 
     # 6 Nessun permesso valido
@@ -571,6 +645,7 @@ def view_all_user(request):
         'error': 'Permesso negato',
         'message': 'Non hai permessi per visualizzare utenti'
     }, status=status.HTTP_403_FORBIDDEN)
+
 
 @api_view(['DELETE'])
 def delete_user(request):
@@ -616,7 +691,8 @@ def delete_user(request):
 
         # 5 Verifica organizzazione
         if user_to_delete.org.id != auth_user.org.id:
-            return Response({'error': 'Non puoi eliminare utenti di altre organizzazioni'}, status=status.HTTP_403_FORBIDDEN)
+            return Response({'error': 'Non puoi eliminare utenti di altre organizzazioni'},
+                            status=status.HTTP_403_FORBIDDEN)
 
         # 6 Soft delete
         user_to_delete.deleted = True
@@ -625,7 +701,7 @@ def delete_user(request):
         return Response({
             'status': 'success',
             'message': f"Utente {user_to_delete.id} marcato come cancellato",
-            'data': { 'user_id': user_to_delete.id }
+            'data': {'user_id': user_to_delete.id}
         }, status=status.HTTP_200_OK)
 
     except Exception as e:
@@ -675,11 +751,13 @@ def update_user(request):
 
         # 4 Verifica permessi generali
         if can_modify_org and user_target.org.id != auth_user.org.id:
-            return Response({'error': 'Non puoi modificare utenti di altre organizzazioni'}, status=status.HTTP_403_FORBIDDEN)
+            return Response({'error': 'Non puoi modificare utenti di altre organizzazioni'},
+                            status=status.HTTP_403_FORBIDDEN)
         elif can_modify_list:
             allowed_lists = get_lists_user_has_permission(auth_user, 'update_user_list').values_list('id', flat=True)
             if not user_target.lists.filter(id__in=allowed_lists).exists() and user_target.id != auth_user.id:
-                return Response({'error': 'Non puoi modificare utenti di liste non autorizzate'}, status=status.HTTP_403_FORBIDDEN)
+                return Response({'error': 'Non puoi modificare utenti di liste non autorizzate'},
+                                status=status.HTTP_403_FORBIDDEN)
         elif user_target.id != auth_user.id:
             return Response({'error': 'Permesso negato per modificare questo utente'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -708,7 +786,8 @@ def update_user(request):
                     lst = List.objects.filter(id=lst_id, org_id=user_target.org.id).first()
                     if lst: lst.users.remove(user_target.id)
             elif can_modify_list:
-                allowed_lists = get_lists_user_has_permission(auth_user, 'update_user_list').values_list('id', flat=True)
+                allowed_lists = get_lists_user_has_permission(auth_user, 'update_user_list').values_list('id',
+                                                                                                         flat=True)
                 for lst_id in lists_to_add:
                     if lst_id in allowed_lists:
                         lst = List.objects.filter(id=lst_id).first()
@@ -718,7 +797,7 @@ def update_user(request):
                         lst = List.objects.filter(id=lst_id).first()
                         if lst:
                             lst.users.remove(user_target.id)
-                            user_target.roles.filter(list_id=lst.id).delete() # Rimuove ruoli di lista associati
+                            user_target.roles.filter(list_id=lst.id).delete()  # Rimuove ruoli di lista associati
 
         user_target.save()
 
@@ -966,6 +1045,7 @@ def create_role(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['PUT'])
 def update_role(request):
     """
@@ -1175,6 +1255,7 @@ def update_role(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['DELETE'])
 def delete_role(request):
     """
@@ -1321,6 +1402,7 @@ def delete_role(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['GET'])
 def view_all_roles(request):
     """
@@ -1435,6 +1517,7 @@ def view_all_roles(request):
         'message': 'Non hai permessi per visualizzare i ruoli richiesti'
     }, status=status.HTTP_403_FORBIDDEN)
 
+
 @api_view(['GET'])
 def view_role_information(request):
     """
@@ -1546,6 +1629,7 @@ def view_role_information(request):
             'count': len(roles_data)
         }
     }, status=status.HTTP_200_OK)
+
 
 # Regex per validare codici colore esadecimali (es. #FF0000)
 HEX_COLOR_REGEX = re.compile(r'^#([A-Fa-f0-9]{6})$')
@@ -1733,6 +1817,7 @@ def update_list(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['POST'])
 def create_list(request):
     """
@@ -1887,6 +1972,7 @@ def create_list(request):
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
 @api_view(['GET'])
 def view_all_lists(request):
     """
@@ -1965,6 +2051,200 @@ def view_all_lists(request):
         }, status=status.HTTP_200_OK)
 
     # GESTIONE ECCEZIONI GENERICHE (Per qualsiasi altro errore inaspettato)
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server inatteso',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+MAX_FILE_SIZE_MB = 50  # 50 Megabytes, esempio di limite
+
+# Conversione in byte per il controllo
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+@extend_schema(
+    summary="Aggiungi File",
+    description="Carica un file (foto, documento, ecc.) e crea un record nel database, associandolo all'Organizzazione o a una Lista specifica.",
+    parameters=[
+        OpenApiParameter(
+            name='list_id',
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.FORM,
+            required=False,
+            description='ID della Lista a cui associare il file (caricamento a livello di lista).'
+        ),
+        OpenApiParameter(
+            name='category_id',
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.FORM,
+            required=False,
+            description='ID della categoria di file a cui associare il file.'
+        ),
+        OpenApiParameter(
+            name='file',
+            type=OpenApiTypes.BINARY,
+            location=OpenApiParameter.FORM,
+            required=True,
+            description='Il file binario da caricare. Accetta qualsiasi tipo (foto, documenti, ecc.).'
+        )
+    ],
+    responses={
+        201: {'description': 'File caricato e registrato con successo.'},
+        400: {'description': 'Dati mancanti, ID non valido o dimensione del file eccessiva.'},
+        401: {'description': 'Autenticazione richiesta.'},
+        403: {'description': 'Permesso negato o utente senza Organizzazione.'},
+        404: {'description': 'Lista o Categoria non trovata.'},
+        409: {'description': 'Errore di integrità del database.'},
+        500: {'description': 'Errore interno (es. fallimento salvataggio I/O).'}
+    }
+)
+@api_view(['POST'])
+@parser_classes([MultiPartParser, FormParser])
+def add_file(request):
+    """
+    Gestisce l'upload di un file generico, verificando i permessi e la dimensione massima.
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+        auth_user = User.objects.filter(id=auth_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        if auth_user.org is None:
+            return Response({'error': 'Utente non associato ad alcuna Organizzazione'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        target_org_id = auth_user.org.id
+
+        data = request.data
+        uploaded_file = request.FILES.get('file')
+        list_id_target_raw = data.get('list_id')
+        category_id_raw = data.get('category_id')
+
+        # 2. CONTROLLO FILE E DIMENSIONE
+        if uploaded_file is None:
+            return Response({'error': 'File mancante', 'message': 'Nessun file trovato nel campo "file".'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if uploaded_file.size > MAX_FILE_SIZE_BYTES:
+            return Response({
+                'error': 'Dimensione file eccessiva',
+                'message': f'La dimensione massima consentita è {MAX_FILE_SIZE_MB} MB.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. CONTROLLO PERMESSI E AUTORIZZAZIONE
+
+        can_org = check_user_permission(auth_user.id, 'add_file_organization')
+        can_list = check_user_permission(auth_user.id, 'add_file_list')
+
+        is_authorized = False
+        list_id_target = None
+
+        if list_id_target_raw:
+            try:
+                list_id_target = int(list_id_target_raw)
+            except ValueError:
+                return Response({'error': 'list_id non valido'}, status=status.HTTP_400_BAD_REQUEST)
+
+            list_target = List.objects.filter(id=list_id_target, org__id=target_org_id).first()
+            if not list_target:
+                return Response({'error': 'Lista non trovata'}, status=status.HTTP_404_NOT_FOUND)
+
+            if can_org:
+                is_authorized = True
+            elif can_list:
+                has_perm_on_list = auth_user.roles.filter(
+                    list_id=list_id_target,
+                    permissions__name='add_file_list'
+                ).exists()
+                if has_perm_on_list:
+                    is_authorized = True
+
+        else:  # Caricamento su Organizzazione (Root)
+            list_id_target = None
+            if can_org:
+                is_authorized = True
+
+        if not is_authorized:
+            return Response({'error': 'Permesso negato',
+                             'message': 'Non hai il permesso sufficiente per aggiungere file in questa posizione.'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        # 4. VALIDAZIONE CAMPI OPZIONALI
+        category_id = None
+        if category_id_raw:
+            try:
+                category_id = int(category_id_raw)
+                # Verifica che la categoria esista e sia dell'Org
+                if not FileCategory.objects.filter(id=category_id, org__id=target_org_id).exists():
+                    return Response({'error': 'Categoria non valida',
+                                     'message': 'La categoria file specificata non esiste nell\'Organizzazione.'},
+                                    status=status.HTTP_404_NOT_FOUND)
+            except ValueError:
+                return Response({'error': 'category_id non valido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        file_name = uploaded_file.name
+
+        # 5. SALVATAGGIO FISICO DEL FILE (Placeholder)
+        try:
+            # --- LOGICA DI SALVATAGGIO SU DISCO/CLOUD (NON IMPLEMENTATA QUI) ---
+            storage_location = f'uploads/{target_org_id}/{list_id_target or "org"}'
+
+            # Simulazione
+            file_path_in_storage = f'{storage_location}/{file_name}'
+            mime_type = uploaded_file.content_type  # Ottiene il tipo MIME corretto dal file
+
+            # --- FINE LOGICA DI SALVATAGGIO ---
+
+        except Exception as e:
+            return Response({'error': 'Errore di I/O', 'message': f'Impossibile salvare il file fisicamente: {str(e)}'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # 6. REGISTRAZIONE NEL DATABASE
+        new_file = File.objects.create(
+            name=file_name,
+            org_id =target_org_id,
+            list_id=list_id_target,
+            user_id=auth_user.id,
+            category_id=category_id,
+            file_path=file_path_in_storage,
+            mime_type=mime_type,
+        )
+
+        # 7. RISPOSTA
+        file_data = {
+            'id': new_file.id,
+            'name': new_file.name,
+            'file_path': new_file.file_path,
+            'mime_type': new_file.mime_type,
+            'list_id': new_file.list_id,
+            'category_id': new_file.category_id,
+            'user_id': new_file.user_id,
+            'uploaded_at': new_file.uploaded_at.isoformat() if hasattr(new_file, 'uploaded_at') else None,
+        }
+
+        return Response({
+            'status': 'success',
+            'message': 'File caricato e registrato con successo.',
+            'data': file_data
+        }, status=status.HTTP_201_CREATED)
+
+    except IntegrityError as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore di integrità del database',
+            'message': f'Verifica che le chiavi esterne (Lista, Categoria) siano valide.'
+        }, status=status.HTTP_409_CONFLICT)
+
     except Exception as e:
         return Response({
             'status': 'error',
