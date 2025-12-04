@@ -68,6 +68,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'votopia_backend.middleware.JWTAuthenticationMiddleware',  # JWT Auth middleware
 ]
 
 ROOT_URLCONF = 'backend_python_votopia.urls'
@@ -189,26 +190,75 @@ SIMPLE_JWT = {
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Votopia API",
-    "DESCRIPTION": "Sistema gestione votazioni, utenti e ruoli",
+    "DESCRIPTION": """
+    ## Sistema di Gestione Votazioni, Utenti e Ruoli
+    
+    ### Autenticazione
+    Questa API utilizza JWT (JSON Web Tokens) per l'autenticazione.
+    
+    **Per autenticarti:**
+    1. Effettua il login tramite `/api/auth/login/` con email e password
+    2. Riceverai un token `access` e un token `refresh`
+    3. Clicca sul pulsante "Authorize" 🔒 in alto a destra
+    4. Inserisci il token nel formato: `Bearer <il_tuo_token_access>`
+    5. Clicca "Authorize" e poi "Close"
+    
+    Ora puoi testare tutti gli endpoint protetti!
+    
+    ### Sistema di Permessi
+    Gli endpoint richiedono permessi specifici basati su ruoli:
+    - **Organizzazione**: Permessi globali per l'intera organizzazione
+    - **Lista**: Permessi limitati a liste specifiche
+    
+    ### Note Importanti
+    - I token JWT scadono dopo 60 minuti
+    - Usa `/api/token/refresh/` per rinnovare il token
+    - Alcuni endpoint sono pubblici (login, health check)
+    - Gli errori 401 indicano autenticazione mancante
+    - Gli errori 403 indicano permessi insufficienti
+    """,
     "VERSION": "1.0.0",
+    "CONTACT": {
+        "name": "Votopia Support",
+        "email": "support@votopia.com"
+    },
+    "LICENSE": {
+        "name": "Proprietary"
+    },
 
     # Opzioni generali
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
+    "COMPONENT_NO_READ_ONLY_REQUIRED": True,
 
     # File locali per UI (migliora prestazioni e funzionamento offline)
     "SWAGGER_UI_DIST": "SIDECAR",
     "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
     "REDOC_DIST": "SIDECAR",
 
+    # Configurazioni UI Swagger
+    "SWAGGER_UI_SETTINGS": {
+        "deepLinking": True,
+        "persistAuthorization": True,  # Mantiene il token anche dopo il refresh della pagina
+        "displayOperationId": True,
+        "filter": True,  # Abilita la ricerca
+        "defaultModelsExpandDepth": 2,
+        "defaultModelExpandDepth": 2,
+        "docExpansion": "list",  # Espande solo i tag, non le operazioni
+        "showExtensions": True,
+        "showCommonExtensions": True,
+    },
+
     # Configurazione autenticazione JWT
     "SECURITY": [{"BearerAuth": []}],
-    "SECURITY_SCHEMES": {
-        "BearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT",
-            "description": "Inserisci il token JWT ottenuto da /api/token/ o /api/auth/login/"
+    "APPEND_COMPONENTS": {
+        "securitySchemes": {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+                "description": "Inserisci il token JWT nel formato: Bearer <token>"
+            }
         }
     },
 
@@ -216,4 +266,26 @@ SPECTACULAR_SETTINGS = {
     "SCHEMA_PATH_PREFIX": "/api/",
     "CAMELIZE_NAMES": False,
     "SORT_OPERATIONS": False,
+    "SORT_OPERATION_PARAMETERS": True,
+
+    # Gestione errori
+    "SERVE_PERMISSIONS": ["rest_framework.permissions.AllowAny"],
+    "SERVERS": [
+        {"url": "http://localhost:8000", "description": "Development server"},
+    ],
+
+    # Tag per raggruppamento
+    "TAGS": [
+        {"name": "System", "description": "Endpoint di sistema (health check)"},
+        {"name": "Autenticazione", "description": "Login, token JWT e gestione sessioni"},
+        {"name": "Utenti", "description": "CRUD utenti e gestione profili"},
+        {"name": "Ruoli", "description": "Gestione ruoli e permessi"},
+        {"name": "Liste", "description": "Gestione liste elettorali"},
+        {"name": "Organization", "description": "Gestione organizzazioni"},
+        {"name": "Files", "description": "Upload e gestione file"},
+    ],
+
+    # Preprocessing per miglioramenti automatici
+    "PREPROCESSING_HOOKS": [],
+    "POSTPROCESSING_HOOKS": [],
 }

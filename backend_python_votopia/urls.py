@@ -76,5 +76,8 @@ urlpatterns = [
     ),
 
     # Organization routes
-    path('api/organization/by-code/', view_organization_by_code, name='view_organization_by_code'),
+    path('api/organizations/by-code/', view_organization_by_code, name='view_organization_by_code'),
+
+    #Lists routes
+    path('api/campaigns/create/', create_campaign, name='create_campaign'),
 ]

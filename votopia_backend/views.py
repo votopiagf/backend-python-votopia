@@ -1,3 +1,4 @@
+from datetime import datetime
 import hashlib
 import re
 from uuid import uuid4
@@ -2471,3 +2472,164 @@ def view_organization_by_code(request):
             'error': 'Errore interno del server inatteso',
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Assumiamo che List, Campaign, User e le funzioni di supporto siano importate
+
+# Formato data atteso nel body della richiesta (es: 'YYYY-MM-DD')
+DATE_FORMAT = '%Y-%m-%d'
+
+
+def serialize_campaign_data(campaign_object):
+    """ Placeholder per la serializzazione di un oggetto Campaign. """
+    return {
+        'id': campaign_object.id,
+        'name': campaign_object.name,
+        'list_id': campaign_object.list_id,
+        'start_date': campaign_object.start_date.strftime(DATE_FORMAT),
+        'end_date': campaign_object.end_date.strftime(DATE_FORMAT),
+    }
+
+
+@extend_schema(
+    summary="Crea Campagna",
+    description="Crea una nuova campagna. La lista (`list_id`) è obbligatoria per associare la campagna. Richiede permessi a livello di Organizzazione o a livello di Lista target.",
+    request={
+        'application/json': {
+            'type': 'object',
+            'properties': {
+                'name': {'type': 'string', 'description': 'Nome della Campagna (Obbligatorio).'},
+                'list_id': {'type': 'integer',
+                            'description': 'ID della Lista a cui la campagna è associata (Obbligatorio).'},
+                'description': {'type': 'string', 'description': 'Descrizione della Campagna (Opzionale).'},
+                'start_date': {'type': 'string', 'format': 'date',
+                               'description': 'Data di inizio della campagna (Formato YYYY-MM-DD, Obbligatorio).'},
+                'end_date': {'type': 'string', 'format': 'date',
+                             'description': 'Data di fine della campagna (Formato YYYY-MM-DD, Obbligatorio).'}
+            },
+            'required': ['name', 'list_id', 'start_date', 'end_date']
+        }
+    },
+    responses={
+        201: {'description': 'Campagna creata con successo.'},
+        400: {'description': 'Dati mancanti, data non valida o formati errati.'},
+        401: {'description': 'Autenticazione richiesta.'},
+        403: {'description': 'Permesso negato (inclusa la violazione Org/Lista).'},
+        404: {'description': 'Lista target non trovata.'},
+        409: {'description': 'Errore di integrità del database.'}
+    }
+)
+@api_view(['POST'])
+def create_campaign(request):
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        auth_user_id = auth_user_data.get('user_id')
+        auth_user = User.objects.filter(id=auth_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        if auth_user.org is None:
+            return Response({'error': 'Utente non associato ad alcuna Organizzazione'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        target_org_id = auth_user.org.id
+
+        data = request.data
+        required = ['name', 'list_id', 'start_date', 'end_date']
+
+        # 2. VALIDAZIONE CAMPI OBBLIGATORI
+        missing_fields = [field for field in required if not data.get(field) or str(data.get(field)).strip() == '']
+        if missing_fields:
+            return Response({'error': 'Campi obbligatori mancanti', 'fields': missing_fields},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. VALIDAZIONE LISTA TARGET
+        try:
+            list_id = int(data['list_id'])
+        except ValueError:
+            return Response({'error': 'list_id non valido', 'message': 'L\'ID della lista deve essere un intero.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Filtra la lista per ID e Organizzazione
+        list_target = List.objects.filter(id=list_id, org__id=target_org_id).first()
+        if list_target is None:
+            return Response({'error': 'Lista non trovata',
+                             'message': 'Lista non trovata o non appartenente alla tua Organizzazione.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        # 4. VALIDAZIONE DATE
+        try:
+            start_date_obj = datetime.strptime(data['start_date'], DATE_FORMAT).date()
+            end_date_obj = datetime.strptime(data['end_date'], DATE_FORMAT).date()
+        except ValueError:
+            return Response(
+                {'error': 'Formato data non valido', 'message': f'Le date devono essere nel formato {DATE_FORMAT}.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        if start_date_obj >= end_date_obj:
+            return Response(
+                {'error': 'Date non valide', 'message': 'La data di inizio deve essere precedente alla data di fine.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        # 5. CONTROLLO PERMESSI E AUTORIZZAZIONE
+        can_org = check_user_permission(auth_user.id, 'create_campaign_organization')
+        can_list = check_user_permission(auth_user.id, 'create_campaign_list')
+
+        is_authorized = False
+
+        if can_org:
+            # L'utente ha il permesso a livello Org, quindi è autorizzato (la Lista è già stata validata per l'Org al punto 3)
+            is_authorized = True
+
+        elif can_list:
+            # L'utente ha il permesso a livello List, ma deve avere un ruolo che glielo conferisce sulla LISTA TARGET
+            is_authorized_on_list = auth_user.roles.filter(
+                list_id=list_id,
+                permissions__name='create_campaign_list'
+            ).exists()
+
+            if is_authorized_on_list:
+                is_authorized = True
+
+        if not is_authorized:
+            return Response({'error': 'Permesso negato',
+                             'message': 'Non hai il permesso sufficiente per creare campagne in questa Lista.'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        # 6. CREAZIONE DELLA CAMPAGNA
+        new_campaign = Campaign.objects.create(
+            list_id=list_id,
+            name=data['name'],
+            description=data.get('description'),  # Opzionale
+            start_date=start_date_obj,
+            end_date=end_date_obj,
+            # Aggiungi qui eventuali altri campi di default
+        )
+
+        # 7. RISPOSTA
+        campaign_data = serialize_campaign_data(new_campaign)
+
+        return Response({
+            'status': 'success',
+            'message': 'Campagna creata con successo.',
+            'data': campaign_data
+        }, status=status.HTTP_201_CREATED)
+
+    except IntegrityError as e:
+        return Response({
+            'status': 'error',
+            'error': 'Conflitto o Errore di integrità',
+            'message': 'Verifica che non esista già una campagna con questo nome o che tutte le chiavi esterne siano valide.'
+        }, status=status.HTTP_409_CONFLICT)
+
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server inatteso',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
