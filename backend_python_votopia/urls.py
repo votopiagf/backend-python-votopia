@@ -31,7 +31,7 @@ urlpatterns = [
     # Test
     path('test/', test, name='test'),
 
-    #Role routes
+    # Role routes
     path('api/roles/create/', create_role, name='create_role'),
     path('api/roles/update/', update_role, name='update_role'),
     path('api/roles/delete/', delete_role, name='delete_role'),
@@ -39,12 +39,12 @@ urlpatterns = [
     path('api/roles/all/', view_all_roles, name='view_all_roles'),
     path('api/roles/info/', view_role_information, name='view_role_information'),
 
-    #Lists routes
+    # Lists routes
     path('api/lists/update/', update_list, name='update_list'),
     path('api/lists/create/', create_list, name='create_list'),
     path('api/lists/all/', view_all_lists, name='view_all_lists'),
 
-    #Swagger
+    # Swagger
     # schema raw
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
 
@@ -55,17 +55,26 @@ urlpatterns = [
         name="swagger-ui",
     ),
 
-    # Redoc (per dev seri e presentazioni a dirigente 🤭)
+    # Redoc
     path(
         "api/redoc/",
         SpectacularRedocView.as_view(url_name="schema"),
         name="redoc",
     ),
 
-
+    # Files routes
     path(
         "api/files/add/",
         add_file,
         name="add_file",
     ),
+
+    path(
+        "api/files/delete/",
+        delete_file,
+        name="delete_file",
+    ),
+
+    # Organization routes
+    path('api/organization/by-code/', view_organization_by_code, name='view_organization_by_code'),
 ]

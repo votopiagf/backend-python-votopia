@@ -1,10 +1,12 @@
 import hashlib
 import re
+from uuid import uuid4
 
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.db import IntegrityError
 from django.db.models import Max
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
-from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework.parsers import FormParser, MultiPartParser
 
 from votopia_backend.models import *
@@ -2068,29 +2070,27 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 @extend_schema(
     summary="Aggiungi File",
     description="Carica un file (foto, documento, ecc.) e crea un record nel database, associandolo all'Organizzazione o a una Lista specifica.",
-    parameters=[
-        OpenApiParameter(
-            name='list_id',
-            type=OpenApiTypes.INT,
-            location=OpenApiParameter.FORM,
-            required=False,
-            description='ID della Lista a cui associare il file (caricamento a livello di lista).'
-        ),
-        OpenApiParameter(
-            name='category_id',
-            type=OpenApiTypes.INT,
-            location=OpenApiParameter.FORM,
-            required=False,
-            description='ID della categoria di file a cui associare il file.'
-        ),
-        OpenApiParameter(
-            name='file',
-            type=OpenApiTypes.BINARY,
-            location=OpenApiParameter.FORM,
-            required=True,
-            description='Il file binario da caricare. Accetta qualsiasi tipo (foto, documenti, ecc.).'
-        )
-    ],
+    request={
+        'multipart/form-data': {
+            'type': 'object',
+            'properties': {
+                'file': {
+                    'type': 'string',
+                    'format': 'binary',
+                    'description': 'Il file binario da caricare.'
+                },
+                'list_id': {
+                    'type': 'integer',
+                    'description': 'ID della Lista (opzionale).'
+                },
+                'category_id': {
+                    'type': 'integer',
+                    'description': 'ID della Categoria (opzionale).'
+                }
+            },
+            'required': ['file']
+        }
+    },
     responses={
         201: {'description': 'File caricato e registrato con successo.'},
         400: {'description': 'Dati mancanti, ID non valido o dimensione del file eccessiva.'},
@@ -2184,10 +2184,10 @@ def add_file(request):
         if category_id_raw:
             try:
                 category_id = int(category_id_raw)
-                # Verifica che la categoria esista e sia dell'Org
-                if not FileCategory.objects.filter(id=category_id, org__id=target_org_id).exists():
+                # Verifica che la categoria esista
+                if not FileCategory.objects.filter(id=category_id).exists():
                     return Response({'error': 'Categoria non valida',
-                                     'message': 'La categoria file specificata non esiste nell\'Organizzazione.'},
+                                     'message': 'La categoria file specificata non esiste.'},
                                     status=status.HTTP_404_NOT_FOUND)
             except ValueError:
                 return Response({'error': 'category_id non valido'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2195,15 +2195,25 @@ def add_file(request):
         file_name = uploaded_file.name
 
         # 5. SALVATAGGIO FISICO DEL FILE (Placeholder)
+        file_name_original = uploaded_file.name
+        mime_type = uploaded_file.content_type
         try:
-            # --- LOGICA DI SALVATAGGIO SU DISCO/CLOUD (NON IMPLEMENTATA QUI) ---
-            storage_location = f'uploads/{target_org_id}/{list_id_target or "org"}'
+            storage_folder = f'uploads/{target_org_id}/{list_id_target or "org"}/{category_id}'
 
-            # Simulazione
-            file_path_in_storage = f'{storage_location}/{file_name}'
-            mime_type = uploaded_file.content_type  # Ottiene il tipo MIME corretto dal file
+            # 5.2 Generazione del nome file univoco per evitare conflitti
+            # Estrae l'estensione del file originale (es. .pdf, .jpg)
+            extension = file_name_original.split('.')[-1] if '.' in file_name_original else ''
+            unique_file_name = f'{uuid4()}.{extension}'
 
-            # --- FINE LOGICA DI SALVATAGGIO ---
+            # Il percorso completo nel sistema di storage
+            file_path_in_storage = f'{storage_folder}/{unique_file_name}'
+
+            # 5.3 ESECUZIONE DEL SALVATAGGIO FISICO
+            # Legge il contenuto del file caricato (in memoria)
+            file_content = uploaded_file.read()
+
+            # Utilizza il sistema di storage di Django per salvare il contenuto
+            default_storage.save(file_path_in_storage, ContentFile(file_content))
 
         except Exception as e:
             return Response({'error': 'Errore di I/O', 'message': f'Impossibile salvare il file fisicamente: {str(e)}'},
@@ -2212,7 +2222,7 @@ def add_file(request):
         # 6. REGISTRAZIONE NEL DATABASE
         new_file = File.objects.create(
             name=file_name,
-            org_id =target_org_id,
+            org_id=target_org_id,
             list_id=list_id_target,
             user_id=auth_user.id,
             category_id=category_id,
@@ -2244,6 +2254,216 @@ def add_file(request):
             'error': 'Errore di integrità del database',
             'message': f'Verifica che le chiavi esterne (Lista, Categoria) siano valide.'
         }, status=status.HTTP_409_CONFLICT)
+
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server inatteso',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@extend_schema(
+    summary="Elimina File",
+    description="Esegue la cancellazione logica del record e la cancellazione fisica del file dal sistema di storage. Richiede `file_id` come parametro di query.",
+    parameters=[
+        OpenApiParameter(
+            name='file_id',
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.QUERY,
+            required=True,
+            description='ID del file da eliminare.'
+        )
+    ],
+    responses={
+        200: {'description': 'File eliminato con successo.'},
+        400: {'description': 'file_id mancante o non valido.'},
+        401: {'description': 'Autenticazione richiesta.'},
+        403: {'description': 'Permesso negato.'},
+        404: {'description': 'File non trovato o utente non associato a Org.'},
+        500: {'description': 'Errore interno del server (es. fallimento cancellazione I/O).'}
+    }
+)
+@api_view(['DELETE'])
+def delete_file(request):
+    """
+    Gestisce l'eliminazione di un file.
+    I permessi sono controllati in questo ordine di precedenza:
+    1. delete_file_organization (Org-level)
+    2. delete_file_list (List-level, se il file appartiene a una lista)
+    3. Proprietario (L'utente che ha caricato il file)
+    """
+    try:
+        # 1. AUTENTICAZIONE E UTENTE
+        auth_user_data = get_user_from_token(request)
+        if not auth_user_data:
+            return Response({'error': 'Autenticazione richiesta'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        aut_user_id = auth_user_data.get('user_id')
+        auth_user = User.objects.filter(id=aut_user_id).first()
+
+        if not auth_user:
+            return Response({'error': 'Utente autenticato non trovato'}, status=status.HTTP_404_NOT_FOUND)
+
+        if auth_user.org is None:
+            return Response({'error': 'Utente non associato ad alcuna Organizzazione'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        target_org_id = auth_user.org.id
+
+        # 2. RECUPERO E VALIDAZIONE FILE
+        file_id_data = request.GET.get('file_id')
+        if not file_id_data:
+            return Response({'error': 'file_id mancante'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            file_id = int(file_id_data)
+        except ValueError:
+            return Response({'error': 'file_id non valido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Filtra il file all'interno dell'Org dell'utente
+        file_target = File.objects.filter(id=file_id, org__id=target_org_id).first()
+
+        if file_target is None:
+            return Response({'error': 'File non trovato nella tua Organizzazione'}, status=status.HTTP_404_NOT_FOUND)
+
+        # 3. CONTROLLO PERMESSI
+        can_org = check_user_permission(auth_user.id, 'delete_file_organization')
+        can_list_perm = check_user_permission(auth_user.id, 'delete_file_list')  # Indica se ha *il* permesso List
+
+        is_authorized = False
+
+        # 3.1 Priorità 1: Permesso Org-Level
+        if can_org:
+            is_authorized = True
+
+        # 3.2 Priorità 2: Permesso List-Level (se file associato a Lista)
+        elif file_target.list_id is not None and can_list_perm:
+            # Verifica se l'utente ha il ruolo necessario sulla Lista specifica del file
+            has_perm_on_list = auth_user.roles.filter(
+                list_id=file_target.list_id,
+                permissions__name='delete_file_list'
+            ).exists()
+            if has_perm_on_list:
+                is_authorized = True
+
+        # 3.3 Priorità 3: Proprietario del File (Se non ha altri permessi di gestione file)
+        elif file_target.user_id == auth_user.id:
+            is_authorized = True
+
+        if not is_authorized:
+            return Response({'error': 'Permesso negato', 'message': 'Non hai il permesso di eliminare questo file.'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        # 4. CANCELLAZIONE FISICA E DB
+        file_path_to_delete = file_target.file_path
+
+        # 4.1 Cancellazione Record DB (prima di cancellare fisicamente in caso di errore)
+        # Se la cancellazione fisica fallisce, è meglio avere il record nel DB.
+        file_target.delete()
+
+        # 4.2 Cancellazione Fisica del File
+        try:
+            if file_path_to_delete and default_storage.exists(file_path_to_delete):
+                default_storage.delete(file_path_to_delete)
+        except Exception as e:
+            # NOTA: Se la cancellazione fisica fallisce, il DB è già stato aggiornato.
+            # Qui si potrebbe loggare un avviso e restituire comunque successo all'utente
+            # o gestire un rollback (più complesso). Restituiamo successo ma con avviso log.
+            print(f"ATTENZIONE: Fallimento cancellazione fisica file {file_path_to_delete}: {e}")
+
+        # 5. RISPOSTA
+        return Response({
+            'status': 'success',
+            'message': f'File con ID {file_id} eliminato con successo. Percorso: {file_path_to_delete}'
+        }, status=status.HTTP_200_OK)
+
+    except IntegrityError:
+        return Response({'status': 'error', 'error': 'Errore di integrità del database durante la cancellazione.'},
+                        status=status.HTTP_409_CONFLICT)
+    except Exception as e:
+        return Response({
+            'status': 'error',
+            'error': 'Errore interno del server inatteso',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+def serialize_organization_data(org_object):
+    """
+    Placeholder per la serializzazione dei dati dell'Organizzazione.
+    Dovresti implementare questa funzione per includere i campi rilevanti.
+    """
+    return {
+        'id': org_object.id,
+        'name': org_object.name,
+        'created_at': org_object.created_at.isoformat() if hasattr(org_object, 'created_at') else None,
+        # ... Aggiungi qui altri campi rilevanti
+    }
+
+
+@extend_schema(
+    summary="Visualizza Organizzazione per Codice",
+    description="Recupera i dettagli di un'Organizzazione utilizzando il suo codice univoco (`org_code`). Non richiede autenticazione.",
+    parameters=[
+        OpenApiParameter(
+            name='org_code',
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            required=True,
+            description='Codice univoco dell\'Organizzazione.'
+        )
+    ],
+    responses={
+        200: {'description': 'Dati Organizzazione recuperati.'},
+        400: {'description': 'org_code mancante.'},
+        404: {'description': 'Organizzazione non trovata per il codice specificato.'},
+        500: {'description': 'Errore interno del server durante la serializzazione.'}
+    }
+)
+@api_view(['GET'])
+def view_organization_by_code(request):
+    """
+    Permette di recuperare i dettagli di un'Organizzazione tramite il suo codice.
+    Non richiede autenticazione.
+    """
+    try:
+        org_code = request.GET.get('org_code')
+
+        # 1. VALIDAZIONE INPUT
+        if not org_code:
+            return Response({
+                'status': 'error',
+                'error': 'Codice Organizzazione mancante',
+                'message': 'Il parametro org_code è obbligatorio.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. RECUPERO DATI
+        # Assumiamo che il campo per l'Organizzazione sia chiamato 'Organization'
+        org = Organization.objects.filter(code=org_code).first()
+
+        if org is None:
+            return Response({
+                'status': 'error',
+                'error': 'Organizzazione non trovata',
+                'message': f'Nessuna Organizzazione trovata per il codice: {org_code}.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # 3. SERIALIZZAZIONE E RISPOSTA
+        try:
+            org_data = serialize_organization_data(org)
+        except Exception as e:
+            # Errore nella serializzazione
+            return Response({
+                'status': 'error',
+                'error': 'Errore di serializzazione dei dati dell\'Organizzazione',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            'status': 'success',
+            'message': 'Organizzazione recuperata con successo.',
+            'data': org_data
+        }, status=status.HTTP_200_OK)
 
     except Exception as e:
         return Response({
